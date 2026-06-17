@@ -1,9 +1,0 @@
-original,shapefile
-candidate_tea,cand_tea
-class_confidence,class_conf
-capture_timestamp_sec,cap_time
-source_estate,src_est
-source_latitude,src_lat
-source_longitude,src_lon
-source_buffer_id,src_buf
-tea,tea
