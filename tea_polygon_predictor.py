@@ -2,28 +2,25 @@
 """
 Predict tea probability for polygons in a GeoJSON using a saved XGBoost model.
 
-What it does:
-1) Reads an input GeoJSON of polygons.
-2) Removes existing candidate_tea/tea attributes if present.
-3) Uses Google Earth Engine to compute the model's feature set per polygon.
-4) Runs the saved model to obtain tea_probability.
-5) Writes:
-   - polygons_with_tea_probability.geojson   (all polygons + probability + tea label)
-   - polygons_tea_1.geojson                 (tea_probability > 0.995)
-   - polygons_tea_0.geojson                 (tea_probability <= 0.995)
+Process:
+Polygon
+  -> sample all Sentinel pixels inside polygon
+  -> run pixel model on each pixel
+  -> aggregate to polygon metrics:
+       tea_probability = mean(pixel probabilities)
+       tea_fraction    = fraction of pixels with p > 0.95
+       n_pixels        = number of valid pixels sampled
+  -> tea = 1 if tea_fraction >= TEA_FRACTION_THRESHOLD else 0
 
-Requirements:
-    pip install geopandas pandas numpy joblib scikit-learn xgboost earthengine-api geemap python-dotenv
-
-Before running:
-    1) Put your GEE project ID in the environment variable GEE_PROJECT_ID
-       or replace <project_id> below.
-    2) Make sure Earth Engine is authenticated.
+Outputs:
+- polygons_with_tea_probability.geojson
+- polygons_tea_1.geojson
+- polygons_tea_0.geojson
+- polygons_tea_metrics.csv
 """
 
 import os
 import math
-from pathlib import Path
 
 import ee
 import joblib
@@ -42,15 +39,18 @@ MODEL_PATH = "tea_xgb_pixel_model.pkl"
 OUTPUT_ALL_GEOJSON = "polygons_with_tea_probability.geojson"
 OUTPUT_TEA1_GEOJSON = "polygons_tea_1.geojson"
 OUTPUT_TEA0_GEOJSON = "polygons_tea_0.geojson"
+OUTPUT_METRICS_CSV = "polygons_tea_metrics.csv"
 
-# Earth Engine / imagery settings
 DATE_START = "2023-01-01"
 DATE_END = "2025-01-01"
 CLOUDY_PIXEL_PERCENTAGE = 20
-SCALE_M = 10   # use 10 m; change to 20 if you want a coarser polygon mean
-BATCH_SIZE = 200  # smaller = safer, larger = faster
 
-# If you prefer hardcoding, replace <project_id> directly.
+SCALE_M = 10
+BATCH_SIZE = 200
+
+PIXEL_PROB_THRESHOLD = 0.95
+TEA_FRACTION_THRESHOLD = 0.20  # conservative starting point
+
 load_dotenv()
 GEE_PROJECT_ID = os.getenv("GEE_PROJECT_ID", "<project_id>")
 
@@ -64,7 +64,6 @@ if not GEE_PROJECT_ID or GEE_PROJECT_ID == "<project_id>":
 # =============================================================================
 
 def drop_unwanted_attributes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Remove candidate_tea and tea if they exist, preserve everything else."""
     cols_to_drop = [c for c in ["candidate_tea", "tea"] if c in gdf.columns]
     if cols_to_drop:
         gdf = gdf.drop(columns=cols_to_drop)
@@ -72,13 +71,10 @@ def drop_unwanted_attributes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 
 def ensure_poly_id(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Guarantee a stable unique key for merging predictions back."""
+    gdf = gdf.copy()
     if "poly_id" not in gdf.columns:
-        gdf = gdf.copy()
         gdf["poly_id"] = range(len(gdf))
     else:
-        # Keep as integer if possible
-        gdf = gdf.copy()
         gdf["poly_id"] = pd.to_numeric(gdf["poly_id"], errors="coerce").astype("Int64")
         if gdf["poly_id"].isna().any():
             raise ValueError("poly_id contains non-numeric values.")
@@ -86,7 +82,6 @@ def ensure_poly_id(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 
 def mask_s2_sr(image: ee.Image) -> ee.Image:
-    """Basic QA60 cloud/cirrus mask for Sentinel-2 SR Harmonized."""
     qa = image.select("QA60")
     cloud_bit = 1 << 10
     cirrus_bit = 1 << 11
@@ -95,7 +90,6 @@ def mask_s2_sr(image: ee.Image) -> ee.Image:
 
 
 def build_composite() -> ee.Image:
-    """Build a cloud-masked Sentinel-2 median composite with all model bands."""
     s2 = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(DATE_START, DATE_END)
@@ -105,7 +99,6 @@ def build_composite() -> ee.Image:
 
     img = s2.median()
 
-    # Indices
     ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
     gndvi = img.normalizedDifference(["B8", "B3"]).rename("GNDVI")
     ndwi = img.normalizedDifference(["B3", "B8"]).rename("NDWI")
@@ -127,7 +120,6 @@ def build_composite() -> ee.Image:
 
 
 def make_ee_feature_collection(chunk: gpd.GeoDataFrame, prop_cols: list[str]) -> ee.FeatureCollection:
-    """Convert a GeoDataFrame chunk to an EE FeatureCollection."""
     feats = []
     for _, row in chunk.iterrows():
         props = {}
@@ -148,25 +140,25 @@ def make_ee_feature_collection(chunk: gpd.GeoDataFrame, prop_cols: list[str]) ->
     return ee.FeatureCollection(feats)
 
 
-def ee_reduce_batch(image: ee.Image, fc: ee.FeatureCollection, feature_cols: list[str]) -> pd.DataFrame:
+def ee_sample_pixels_batch(image: ee.Image, fc: ee.FeatureCollection, feature_cols: list[str]) -> pd.DataFrame:
     """
-    Reduce image over polygons for one batch and return a DataFrame containing
-    poly_id plus the model feature columns.
+    Sample all valid pixels inside polygons for one batch.
+    Returns a DataFrame with poly_id + model feature columns.
     """
-    reduced = image.reduceRegions(
+    sampled = image.sampleRegions(
         collection=fc,
-        reducer=ee.Reducer.mean(),
+        properties=["poly_id"],
         scale=SCALE_M,
+        geometries=False,
         tileScale=4,
     )
 
-    info = reduced.getInfo()
+    info = sampled.getInfo()
     rows = []
+
     for f in info.get("features", []):
         props = f.get("properties", {})
-        row = {}
-        # Keep only the required join key and model features
-        row["poly_id"] = props.get("poly_id")
+        row = {"poly_id": props.get("poly_id")}
         for col in feature_cols:
             row[col] = props.get(col, np.nan)
         rows.append(row)
@@ -179,7 +171,6 @@ def ee_reduce_batch(image: ee.Image, fc: ee.FeatureCollection, feature_cols: lis
 # =============================================================================
 
 def main() -> None:
-    # Load model first so we know the exact feature list / order
     model = joblib.load(MODEL_PATH)
 
     if not hasattr(model, "feature_names_in_"):
@@ -191,31 +182,24 @@ def main() -> None:
     feature_cols = list(model.feature_names_in_)
     print("Model features:", feature_cols)
 
-    # Load polygons
     gdf = gpd.read_file(INPUT_GEOJSON)
     gdf = drop_unwanted_attributes(gdf)
     gdf = ensure_poly_id(gdf)
 
-    # Keep geometry and original attrs, but work on a copy
     if gdf.empty:
         raise RuntimeError("Input GeoJSON contains no polygons.")
 
-    # Initialize EE
     ee.Initialize(project=GEE_PROJECT_ID)
-
-    # Build composite once
     composite = build_composite()
 
-    # Property columns to carry into Earth Engine; exclude geometry
     prop_cols = [c for c in gdf.columns if c != "geometry"]
 
-    # Batch process polygons to avoid timeouts
     n = len(gdf)
     n_batches = math.ceil(n / BATCH_SIZE)
     print(f"Polygons: {n}")
     print(f"Batches: {n_batches} (batch size = {BATCH_SIZE})")
 
-    feature_frames = []
+    per_batch_frames = []
 
     for i in range(n_batches):
         start = i * BATCH_SIZE
@@ -225,32 +209,71 @@ def main() -> None:
         print(f"Processing batch {i+1}/{n_batches}  rows {start}:{end}")
 
         fc = make_ee_feature_collection(chunk, prop_cols=prop_cols)
-        batch_df = ee_reduce_batch(composite, fc, feature_cols=feature_cols)
+        px_df = ee_sample_pixels_batch(composite, fc, feature_cols=feature_cols)
 
-        if batch_df.empty:
-            print("  WARNING: batch returned no rows.")
+        if px_df.empty:
+            print("  WARNING: batch returned no sampled pixels.")
             continue
 
-        feature_frames.append(batch_df)
+        # Convert model inputs to numeric and drop rows with missing feature values
+        X_px = px_df[feature_cols].apply(pd.to_numeric, errors="coerce")
+        valid_mask = X_px.notna().all(axis=1)
 
-    if not feature_frames:
-        raise RuntimeError("No features were extracted from Earth Engine.")
+        px_df = px_df.loc[valid_mask].copy()
+        X_px = X_px.loc[valid_mask].copy()
 
-    features_df = pd.concat(feature_frames, ignore_index=True)
+        if px_df.empty:
+            print("  WARNING: batch had pixels, but all were invalid after numeric conversion.")
+            continue
 
-    # Merge back to original geometry/attributes
-    merged = gdf.merge(features_df, on="poly_id", how="left", suffixes=("", "_feat"))
+        # Pixel-level inference
+        px_df["pixel_probability"] = model.predict_proba(X_px)[:, 1]
+        px_df["pixel_tea"] = (px_df["pixel_probability"] > PIXEL_PROB_THRESHOLD).astype(int)
 
-    # Ensure model feature order and numeric dtype
-    X = merged[feature_cols].apply(pd.to_numeric, errors="coerce")
+        # Aggregate to polygon-level metrics
+        agg = (
+            px_df.groupby("poly_id", as_index=False)
+            .agg(
+                tea_probability=("pixel_probability", "mean"),
+                tea_fraction=("pixel_tea", "mean"),
+                n_pixels=("pixel_probability", "size"),
+            )
+        )
 
-    # Predict probabilities
-    merged["tea_probability"] = model.predict_proba(X)[:, 1]
+        per_batch_frames.append(agg)
 
-    # Binary tea label
-    merged["tea"] = (merged["tea_probability"] > 0.995).astype(int)
+    if not per_batch_frames:
+        raise RuntimeError("No pixel samples were extracted from Earth Engine.")
 
-    # Write outputs
+    metrics_df = pd.concat(per_batch_frames, ignore_index=True)
+
+    # If the same poly_id appears in multiple batches, combine again
+    metrics_df = (
+        metrics_df.groupby("poly_id", as_index=False)
+        .agg(
+            tea_probability=("tea_probability", "mean"),
+            tea_fraction=("tea_fraction", "mean"),
+            n_pixels=("n_pixels", "sum"),
+        )
+    )
+
+    merged = gdf.merge(metrics_df, on="poly_id", how="left")
+
+    # Fill polygons with no valid pixels
+    merged["tea_probability"] = merged["tea_probability"].fillna(0.0)
+    merged["tea_fraction"] = merged["tea_fraction"].fillna(0.0)
+    merged["n_pixels"] = merged["n_pixels"].fillna(0).astype(int)
+
+    # Final binary label
+    merged["tea"] = (merged["tea_fraction"] >= TEA_FRACTION_THRESHOLD).astype(int)
+
+    # Save compact metrics CSV for future use
+    merged[["poly_id", "tea_probability", "tea_fraction", "n_pixels", "tea"]].to_csv(
+        OUTPUT_METRICS_CSV,
+        index=False,
+    )
+
+    # Save GeoJSON outputs
     merged.to_file(OUTPUT_ALL_GEOJSON, driver="GeoJSON")
 
     tea1 = merged[merged["tea"] == 1].copy()
@@ -263,6 +286,7 @@ def main() -> None:
     print(f"Saved: {OUTPUT_ALL_GEOJSON}")
     print(f"Saved: {OUTPUT_TEA1_GEOJSON}  (tea=1: {len(tea1)})")
     print(f"Saved: {OUTPUT_TEA0_GEOJSON}  (tea=0: {len(tea0)})")
+    print(f"Saved: {OUTPUT_METRICS_CSV}")
 
 
 if __name__ == "__main__":
